@@ -5,9 +5,11 @@ Converts log entries into Polars DataFrames backed by Pydantic models.
 
 import hashlib
 import re
+from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime, date
 from pathlib import Path
-from typing import List, Union
+from typing import List, Optional, Union
+import os
 
 import polars as pl
 from simple_web_stat.model import ApacheLogEntry
@@ -17,6 +19,7 @@ from simple_web_stat.model import ApacheLogEntry
 # Format: remote_host ident authuser [timestamp] "request" status_code bytes_sent "referrer" "user_agent"
 # Supports both IPv4 and IPv6 addresses
 # Handles quoted fields that may contain escaped quotes
+# More lenient with malformed entries
 APACHE_LOG_PATTERN = re.compile(
     r'^(?P<remote_host>[\da-fA-F.:]+|\S+)\s+'  # IPv4, IPv6, or hostname
     r'(?P<ident>\S+)\s+'
@@ -24,14 +27,16 @@ APACHE_LOG_PATTERN = re.compile(
     r'\[(?P<timestamp>[^\]]+)\]\s+'
     r'"(?P<request_line>(?:\\.|[^"])*)"\s+'  # Request line with escaped char support
     r'(?P<status_code>\d+)\s+'
-    r'(?P<bytes_sent>\d+|-)\s+'
-    r'"(?P<referrer>(?:\\.|[^"])*)"\s+'  # Referrer with escaped char support
-    r'"(?P<user_agent>(?:\\.|[^"])*)"\s*$'  # User-agent with escaped char support
+    r'(?P<bytes_sent>\d+|-)(?:\s+|$)'  # bytes_sent, may be at end of line
+    r'(?:\s*"(?P<referrer>(?:\\.|[^"])*?)")?'  # Optional referrer
+    r'(?:\s*"(?P<user_agent>(?:\\.|[^"])*?)")?'  # Optional user-agent
+    r'.*$'  # Allow trailing content
 )
 
 # Regex pattern for parsing the request line (e.g., "GET /path HTTP/1.1")
+# More lenient: allows missing parts
 REQUEST_LINE_PATTERN = re.compile(
-    r'^(?P<http_method>\S+)\s+(?P<uri>\S+)\s+(?P<http_version>\S+)$'
+    r'^(?P<http_method>\S+)\s+(?P<uri>\S*)\s*(?P<http_version>\S*)$'
 )
 
 
@@ -69,6 +74,7 @@ def parse_log_line(line: str) -> Union[ApacheLogEntry, None]:
     
     Returns None if the line cannot be parsed.
     Handles malformed lines by cleaning them up first.
+    Very lenient - accepts entries with missing or malformed trailing fields.
     """
     # Strip leading/trailing whitespace and handle lines with embedded newlines
     line = line.rstrip('\n\r')
@@ -77,36 +83,65 @@ def parse_log_line(line: str) -> Union[ApacheLogEntry, None]:
     if '\n' in line or '\r' in line:
         return None
     
+    # Skip lines with only whitespace or quotes
+    if not line or line.strip() in ('', '""', '"-"'):
+        return None
+    
     match = APACHE_LOG_PATTERN.match(line)
     if not match:
         return None
     
     groups = match.groupdict()
     
+    # Get the request line and validate/parse it
+    request_line = groups["request_line"].strip()
+    
+    # Skip empty or malformed request lines (just newlines, binary data, etc)
+    if not request_line or '\\n' in request_line or '\\x' in request_line:
+        return None
+    
     # Handle "-" as empty request (common for 4xx errors)
-    if groups["request_line"] == "-":
+    if request_line == "-":
         http_method = "-"
         uri = "-"
         http_version = "-"
     else:
-        # Parse request line
-        request_match = REQUEST_LINE_PATTERN.match(groups["request_line"])
+        # Parse request line - be lenient with missing parts
+        request_match = REQUEST_LINE_PATTERN.match(request_line)
         if not request_match:
+            # If request line doesn't match standard format, skip it
             return None
         
         request_groups = request_match.groupdict()
         http_method = request_groups["http_method"]
-        uri = request_groups["uri"]
-        http_version = request_groups["http_version"]
+        uri = request_groups.get("uri") or "-"
+        http_version = request_groups.get("http_version") or "-"
+        
+        # Skip if we couldn't parse at least the method
+        if not http_method:
+            return None
+        
+        # For truly malformed methods that don't look like HTTP, skip
+        if http_method not in ["GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH", "TRACE", "CONNECT"]:
+            # Could be corrupted data, but give it a chance if the rest looks OK
+            pass
     
     # Convert bytes_sent to int (handle "-" as 0)
-    bytes_sent = int(groups["bytes_sent"]) if groups["bytes_sent"] != "-" else 0
+    try:
+        bytes_sent = int(groups["bytes_sent"]) if groups["bytes_sent"] != "-" else 0
+    except (ValueError, TypeError):
+        bytes_sent = 0
     
     # Handle "-" values as None for optional fields
     ident = None if groups["ident"] == "-" else groups["ident"]
     authuser = None if groups["authuser"] == "-" else groups["authuser"]
-    referrer = None if groups["referrer"] == "-" else groups["referrer"]
-    user_agent = None if groups["user_agent"] == "-" else groups["user_agent"]
+    
+    # Handle referrer/user_agent which may be None from regex
+    referrer = groups.get("referrer")
+    referrer = None if not referrer or referrer == "-" else referrer
+    
+    user_agent = groups.get("user_agent")
+    user_agent = None if not user_agent or user_agent == "-" else user_agent
     
     try:
         entry = ApacheLogEntry(
@@ -123,8 +158,7 @@ def parse_log_line(line: str) -> Union[ApacheLogEntry, None]:
             user_agent=user_agent,
         )
         return entry
-    except (ValueError, TypeError) as e:
-        print(f"Error parsing log line: {line}\n  Error: {e}")
+    except (ValueError, TypeError):
         return None
 
 
@@ -179,14 +213,15 @@ def parse_log_file(filepath: Union[str, Path]) -> pl.DataFrame:
     return df
 
 
-def parse_log_files(directory: Union[str, Path], pattern: str = "*.log") -> pl.DataFrame:
+def parse_log_files(directory: Union[str, Path], pattern: str = "*.log", num_workers: Optional[int] = None) -> pl.DataFrame:
     """
     Parse multiple Apache log files from a directory into a single Polars DataFrame.
-    Skips empty files gracefully.
+    Skips empty files gracefully and uses parallel processing for speed.
     
     Args:
         directory: Path to directory containing log files
         pattern: Glob pattern for matching log files (default: "*.log")
+        num_workers: Number of parallel workers (default: CPU count)
         
     Returns:
         A combined Polars DataFrame with all log entries
@@ -201,27 +236,45 @@ def parse_log_files(directory: Union[str, Path], pattern: str = "*.log") -> pl.D
     if not log_files:
         raise ValueError(f"No log files matching pattern '{pattern}' found in {directory}")
     
-    combined_df = None
-    for log_file in sorted(log_files):
-        # Skip empty files
-        if log_file.stat().st_size == 0:
-            print(f"Skipping {log_file.name} (empty file)")
-            continue
-            
-        print(f"Parsing {log_file.name}...")
-        try:
-            df = parse_log_file(log_file)
-            
-            # Concatenate incrementally to avoid storing all dataframes in memory
-            if combined_df is None:
-                combined_df = df
-            else:
-                combined_df = pl.concat([combined_df, df])
-        except ValueError as e:
-            print(f"Skipping {log_file.name}: {e}")
-            continue
+    # Filter out empty files
+    non_empty_files = [f for f in sorted(log_files) if f.stat().st_size > 0]
     
-    if combined_df is None:
-        raise ValueError("No valid log entries found in any file")
+    if not non_empty_files:
+        raise ValueError(f"All log files in {directory} are empty")
+    
+    print(f"Parsing {len(non_empty_files)} files with parallel processing...")
+    
+    # Set number of workers to CPU count if not specified
+    if num_workers is None:
+        num_workers = os.cpu_count() or 4
+    
+    dataframes = []
+    failed_files = []
+    
+    # Use ProcessPoolExecutor for parallel file parsing
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        futures = {executor.submit(parse_log_file, f): f for f in non_empty_files}
         
+        for future in futures:
+            log_file = futures[future]
+            try:
+                df = future.result()
+                dataframes.append(df)
+                print(f"✓ Parsed {log_file.name}: {len(df)} entries")
+            except ValueError as e:
+                print(f"⊘ Skipped {log_file.name}: {e}")
+                failed_files.append(log_file.name)
+            except Exception as e:
+                print(f"✗ Error parsing {log_file.name}: {e}")
+                failed_files.append(log_file.name)
+    
+    if not dataframes:
+        raise ValueError("No valid log entries found in any file")
+    
+    print(f"Combining {len(dataframes)} dataframes...")
+    combined_df = pl.concat(dataframes)
+    
+    if failed_files:
+        print(f"Warning: {len(failed_files)} files were skipped")
+    
     return combined_df
